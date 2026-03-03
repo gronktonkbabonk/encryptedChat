@@ -6,15 +6,14 @@
 
 import { addMessagePreEditListener, addMessagePreSendListener, removeMessagePreEditListener, removeMessagePreSendListener } from "@api/MessageEvents";
 import { updateMessage } from "@api/MessageUpdater";
+import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 import { Message } from "@vencord/discord-types";
-import { log } from "console";
-
 const regexStartEnd = /START\|([a-zA-Z0-9+/]*?={0,3})\|END/;
 
 const IV_LEN = 16;
 const CHECKSUM_LEN = 8; // Ought to be enuf
-const AES_BLOCKSIZE = 128;
+const AES_BLOCKSIZE = 16;
 const password = crypto.getRandomValues(new Uint8Array(32));
 let binary = "";
 password.forEach(element => binary += String.fromCharCode(element));
@@ -26,6 +25,8 @@ console.log("Your password is: " + btoa(binary));
  * |=============================================================================================|
 */
 
+
+const LOGGER = new Logger("EncryptedChat", "#ff9900");
 
 async function encrypt(text: string, password: Uint8Array<ArrayBuffer>) {
     const messageBytes = new TextEncoder().encode(text);
@@ -100,34 +101,52 @@ async function createChecksum(bytes: Uint8Array<ArrayBuffer>): Promise<Uint8Arra
 async function messageEncrypt(inText: string, channel_id: string): Promise<string> {
     const textBytes = new TextEncoder().encode(inText);
     const checksum = await createChecksum(textBytes);
+    LOGGER.log(`Plain bytes: ${textBytes}`);
+    LOGGER.log(`Encrypt checksum: ${checksum}`);
     const { encrypted, iv } = await encrypt(inText, await getStandardKey(channel_id));
     const messageBytes = concatArrayBuffers(iv, checksum, new Uint8Array(encrypted));
-    return `START|${messageBytes.toBase64()}|END`;
+    return `START|${toBase64(messageBytes)}|END`;
 }
 
+function uint8ArraysEqual(a, b) {
+    if (a === b) return true; // same reference
+    if (a.length !== b.length) return false;
+
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+
+    return true;
+}
 
 async function tryMessageDecrypt(bytes: Uint8Array<ArrayBuffer>, channel_id: string): Promise<undefined | string> {
-    if ((bytes.length - IV_LEN - CHECKSUM_LEN) % AES_BLOCKSIZE !== 0) {
+    if ((bytes.byteLength - IV_LEN - CHECKSUM_LEN) % AES_BLOCKSIZE !== 0) {
         // This can't be a valid payload since the sizes are wrong
-        log(`Message has valid Start End encoding, yet payload size (${bytes.length - IV_LEN - CHECKSUM_LEN}) is wrong (Should be a multiple of ${AES_BLOCKSIZE}).`);
-        return;
+        LOGGER.warn(`Message has valid Start End encoding, yet payload size (${bytes.byteLength - IV_LEN - CHECKSUM_LEN}) is wrong (Should be a multiple of ${AES_BLOCKSIZE}).`);
+        // return;
     }
     const iv = bytes.slice(0, IV_LEN);
+    LOGGER.log("Decrypt IVS: ", iv);
     const messageChecksum = bytes.slice(IV_LEN, IV_LEN + CHECKSUM_LEN);
-    const encrypted = bytes.slice(IV_LEN + CHECKSUM_LEN, bytes.length);
+    LOGGER.log("Decrypt checksum: ", messageChecksum);
+
+    const encrypted = bytes.slice(IV_LEN + CHECKSUM_LEN, bytes.byteLength);
+    LOGGER.log("Encrypted Bytes: ", encrypted);
+
     const decrypted = await decrypt(encrypted, await getStandardKey(channel_id), iv);
+    LOGGER.log("Decrypted ", decrypted);
 
     const checksum = await createChecksum(decrypted);
 
-    if (messageChecksum !== checksum) {
-        log("Message decryption was successful but checksums don't match. Your password is most likely wrong.");
+    if (!uint8ArraysEqual(messageChecksum, checksum)) {
+        LOGGER.warn("Message decryption was successful but checksums don't match. Your password is most likely wrong.");
         return;
     }
     let text;
     try {
         text = new TextDecoder().decode(decrypted);
     } catch {
-        log("Decrypted checksums match, yet encoding threw an exception. This is probably a malicious text injection or smt smt.");
+        LOGGER.warn("Decrypted checksums match, yet encoding threw an exception. This is probably a malicious text injection or smt smt.");
 
         // Probably something fishy going on
         return;
@@ -138,19 +157,30 @@ async function tryMessageDecrypt(bytes: Uint8Array<ArrayBuffer>, channel_id: str
 
 // Optimally we'd be doing this using discords delegate system, but eh
 
+function toBase64(bytes: Uint8Array) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+
+    return btoa(binary);
+}
+
+
 function handleIncomingMessage(message: Message) {
     const matches = regexStartEnd.exec(message.content);
     if (!matches) {
-        log(`Incoming message (${message.content}) didn't match with the regex`);
+        LOGGER.info(`Incoming message (${message.content}) didn't match with the regex`);
         return;
     }
-    const base64 = matches[0][0];
-    log(`Extracted base64 part: '${base64}'`);
+    const base64 = matches[1];
+    LOGGER.info(`Extracted base64 part: '${base64}'`);
     let bytes;
     try {
-        bytes = Uint8Array.fromBase64(base64);
+        const binaryString = atob(base64);
+        bytes = Uint8Array.from(binaryString, c => c.charCodeAt(0));
     } catch {
-        log("Extracted part wasn't valid base 64 (which should be impossible)");
+        LOGGER.error("Extracted part wasn't valid base 64 (which should be impossible)");
         return;
     }
 
