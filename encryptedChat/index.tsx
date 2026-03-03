@@ -54,7 +54,12 @@ async function hash(bytes: Uint8Array<ArrayBuffer>) {
     return new Uint8Array(await crypto.subtle.digest({ name: "SHA-256" }, bytes));
 }
 
-const standardKey = await hash(new TextEncoder().encode("Trans4tw"));
+const standardKey = "Trans4tw";
+
+async function getStandardKey(channel_id: string) {
+    // Channel id to be used later
+    return await hash(new TextEncoder().encode(standardKey));
+}
 
 async function decrypt(messageBytes: Uint8Array<ArrayBuffer>, password: Uint8Array<ArrayBuffer>, iv: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
     const key = await crypto.subtle.importKey(
@@ -92,16 +97,16 @@ async function createChecksum(bytes: Uint8Array<ArrayBuffer>): Promise<Uint8Arra
     return (await hash(bytes)).slice(0, CHECKSUM_LEN);
 }
 
-async function messageEncrypt(inText: string): Promise<string> {
+async function messageEncrypt(inText: string, channel_id: string): Promise<string> {
     const textBytes = new TextEncoder().encode(inText);
     const checksum = await createChecksum(textBytes);
-    const { encrypted, iv } = await encrypt(inText, standardKey);
+    const { encrypted, iv } = await encrypt(inText, await getStandardKey(channel_id));
     const messageBytes = concatArrayBuffers(iv, checksum, new Uint8Array(encrypted));
     return `START|${messageBytes.toBase64()}|END`;
 }
 
 
-async function tryMessageDecrypt(bytes: Uint8Array<ArrayBuffer>): Promise<undefined | string> {
+async function tryMessageDecrypt(bytes: Uint8Array<ArrayBuffer>, channel_id: string): Promise<undefined | string> {
     if ((bytes.length - IV_LEN - CHECKSUM_LEN) % AES_BLOCKSIZE !== 0) {
         // This can't be a valid payload since the sizes are wrong
         log(`Message has valid Start End encoding, yet payload size (${bytes.length - IV_LEN - CHECKSUM_LEN}) is wrong (Should be a multiple of ${AES_BLOCKSIZE}).`);
@@ -110,7 +115,7 @@ async function tryMessageDecrypt(bytes: Uint8Array<ArrayBuffer>): Promise<undefi
     const iv = bytes.slice(0, IV_LEN);
     const messageChecksum = bytes.slice(IV_LEN, IV_LEN + CHECKSUM_LEN);
     const encrypted = bytes.slice(IV_LEN + CHECKSUM_LEN, bytes.length);
-    const decrypted = await decrypt(encrypted, standardKey, iv);
+    const decrypted = await decrypt(encrypted, await getStandardKey(channel_id), iv);
 
     const checksum = await createChecksum(decrypted);
 
@@ -149,7 +154,7 @@ function handleIncomingMessage(message: Message) {
         return;
     }
 
-    tryMessageDecrypt(bytes).then(function (decrypted: string | undefined) {
+    tryMessageDecrypt(bytes, message.channel_id).then(function (decrypted: string | undefined) {
         if (!decrypted) {
             // This message probably wasn't encrypted to begin with
             return;
@@ -181,12 +186,12 @@ export default definePlugin({
 
     start() {
         this.onSent = addMessagePreSendListener(async (channelId, messageObj, extra) => {
-            messageObj.content = await messageEncrypt(messageObj.content);
+            messageObj.content = await messageEncrypt(messageObj.content, channelId);
             return { cancel: false };
         });
 
         this.onEdit = addMessagePreEditListener(async (channelId, messageId, messageObj) => {
-            messageObj.content = await messageEncrypt(messageObj.content);
+            messageObj.content = await messageEncrypt(messageObj.content, channelId);
             return { cancel: false };
         });
     },
